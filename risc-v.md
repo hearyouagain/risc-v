@@ -116,6 +116,11 @@
     + csrrci 令完成两项操作：
         + csr 索引的 CSR 寄存器的值读出，写回结果寄存器 rd 中。
         + 将5位立即数（高位补0扩展）的值逐位作为参考，如rs1中的值某个比特位为 0, csr 索引的 CSR 寄存器中对应的比特位清为0，其他位则不受影响。
++ Reserved Writes Ignored, Reads Ignore Values (WIRI) 读无效 写无效
++ Reserved Writes Preserve Values, Reads Ignore Values (WPRI) 读无效 写入保留原本寄存器中的值
++ Write/Read Only Legal Values (WLRL) 只能读写合法值
++ Write Any Values, Reads Legal Values (WARL) 可以写入任意值， 但是读必须是合法值
+
 
 ## RISC-V指令集
 ### RISC-V整数指令集
@@ -248,6 +253,7 @@ exit_label:
     + 八个控制状态寄存器（CSR）是机器模式下异常处理的必要部分：
         + mtvec（Machine Trap Vector）它保存发生异常时处理器需要跳转到的地址。
         + mepc（Machine Exception PC）它指向发生异常的指令。
+            + 中断和异常的区别： 出现中断时，返回地址 mepc 的值被更新为下一条尚未执行的指令。出现异常时，返回地址 mepc 的值被更新为当前发生异常的指令PC(如果ecall或ebreak造成异常，可能会导致死循环，需要中断处理程序更新mepc)。
         + mcause（Machine Exception Cause）它指示发生异常的种类。
         + mie（Machine Interrupt Enable）它指出处理器目前能处理和必须忽略的中断。
         + mip（Machine Interrupt Pending）它列出目前正准备处理的中断。
@@ -291,10 +297,55 @@ exit_label:
         + sfence.vma 会通知处理器，软件可能已经修改了页表，于是处理器可以相应地刷新转换缓存(TLB, 多次页表访问，分页会大大地降低性能, 所以需要ＴＬＢ)。
             + 它需要两个可选的参数，这样可以缩小缓存刷新的范围。一个位于rs1，它指示了页表哪个虚址对应的转换被修改了；另一个位于 rs2，它给出了被修改页表的进程的地址空间标识符（ASID）。如果两者都是 x0，便会刷新整个转换缓存
 
+## TES(Trusted Execution State)架构
++ ![](./TES.png)
++ pmpentry[top]包括pmpaddr，pmpte.t， pmpcfg.a，pmpcfg.lrwx:
+    + pmpte.t位将区域标记为可信任状态，但该位**只能够在TES=1情况下修改**,如果该位被设置为1，那就是可信区域(尽管之前设置为0过)
+    + pmpaddr表示一个4k区域开始于por_rst_pc, pmpaddr: por_rst_pc[31:13], 2’b00, 11‘b100_0000_0000, (如果想要地址有权限被访问，必须要在pmp中设置)
+    + pmpcfg.a表示使能作为(TOR)top_of_region的入口, 应该就是是否启用pmp
+    + pmpcfg.lrwx表示配置pmp对应地址区域的读、写、执行以及锁定对应地址权限
++ TES=0时被授权只读权限，允许不可信m-mode可见pmp条目以及预留给可信的内存区域，提高软件可维护性
++ TES=1时，所有被执行代码必须来自可信内存区域，尽管允许可信和不可信数据的访问代码；TES=0时，所有可信区域的RWX权限被撤销，一旦对其进行RWX就报错
++ entry n配置了pmpcfg.a = TOR, pmpte.t=1时， 那么pmpaddr[n - 1]在不可信区域下就只是可读的。预防不可信代码修改可信区域
++ cache memory operation(CMO)必须保证在不信任区域的操作不能影响信任区域
++ **信任域跳转不信任域(不改变特权等级)**：
+    + 跳转指令(jal, jr...)
+    + *ret返回
++ **不信任域跳转信任域(不改变特权等级)**：通过TESVEC table(Trusted Execution state Vector)信任执行状态向量表实现。
+    + call(jal or jalr)调用, 其他指令调用产生非法指令异常 (对TESVEC的调用必须使用ra作为链接寄存器, 否则可能引起ROP/JOP return/jump oriented Programming)
+    + tret: trusted return Instruction 跳转ra寄存器内容，并在teseps.ctes中的内容继续执行
+    + TESVEC table应**映射到pmpte.t置位的PMP条目，并在当前特权等级下执行**
+        + T如果没有置位，引发指令访问错误Untrusted TESVEC table
+        + 当前特权等级没有权限，会导致mepc和mtval被设置为跳转TESVEC的相关地址时发生异常
+    + 在TESVEC table前加入一条**标记指令**，可以产生一个额外的安全等级(在TESVEC被破坏的时候)，该功能通过Trusted Machine Exception State Control Register(tmescr)中的eme(entry marker enable)启用
+    ![](./tmescr.png)
+    + TESVEC records: TR获取成功，即进入到TES=1的状态时，Trusted Execution State Entry Point Record ( tesepr ) and the Trusted Execution State Entry Point Status ( teseps )被更新
+    ![](./TR.png) ![](./tesepr.png) ![](./teseps.png)
+    + 通过TESVEC进行信任和非信任域的切换都没有特权等级的变更, 通过TESVEC进入信任域的过程如下：![](./enterTrusted.png)
++ **通用寄存器管理**：
+    + TES 1->0时，jumping 一般Temporary and Saved Registers都被清零,当returm除了a0-a1， Temporary and Function Argument Registers都被清零
++ **异常**：
+    + 在信任域中，异常处理的寄存器也有别名，如tmedeleg, tmtvec,tmepc,tmacause,tmtval ![](./tmstatus.png)
+    + tmeseps所对应寄存器有所变化(pjmp 和 pret位的存在，允许信任切换到非信任时，中断或异常的发生)：![](./tmeseps.png)
+    + tmstatus.mie=0时，非信任引起的异步异常不能被发出，因为该异常可能会破坏信任域的操作
+    + 通过tmtvec处理所有异步异常; 非信任异步异常需要到中断不被mask，或者等到切换非信任域再处理，都是为了保证信任和非信任的的异步异常能分开处理
++ **中断**：
+    + 如果非信任中断发生TES=1时，如果teseps.utie为0，中断等到TES=0时继续处理；如果utie为1，不可信中断（pre-empt）可以抢占可信中断
+    + 抢占可信中断的前提是，tmideleg[N]=1：![](./untrusted_intr.png)
+    + 如果中断被委托，但是teseps.utie=0时，非信任中断需要等到TES=0才能执行;中断延时到TES 1 -> 0，其中一个例子是这样的：![](./delay_ut_intr.png)
+    + 如果中断被委托，teseps.utie=1时，在信任域发生非信任中断：![](./preposthanndle.png)
++ TES 状态转换总结：![](./TES_transition.png)
+
+> 直接在信任域使用非信任域的函数会引起异常, 需要撤销信任等级(TES 1 -> 0): Illegal TES transition(use ret to exit the TES)
+> 非信任域访问信任域，引起异常：Trust related access violation
+
 
 ## 疑问合集：
 > question: PC不是通用寄存器，那么PC值从哪里加载？
->> answer: 使用PC专用寄存器, 而不是通用寄存器, 使得能够修改PC值的指令变少了，提高分支跳转的预测准确性
+>> answer: 使用PC专用寄存器, 而不是通用寄存器, 使得能够修改PC值的指令变少了，提高分支跳转的预测准确性。当前执行指令的PC值，并没有被反映在任何寄存器中,若想读取 PC 的值，只能通过某些指令间接获得，譬如 AUIPC 指令。
 
 > question: risc-v允许非对齐的 load 和 store,为什么异常原因中还会有非对齐的 load 和 store 地址异常
->> answei: 1. 原子内存操作需要自然对齐的地址； 2. 一些实现者选择省略对于非对齐的常规 load 和 store 的硬件支持
+>> answer: 1. 原子内存操作需要自然对齐的地址； 2. 一些实现者选择省略对于非对齐的常规 load 和 store 的硬件支持
+
+> question:  entry n配置了pmpcfg.a = TOR, pmpte.t=1时， 那么pmpaddr[n - 1]在不可信区域下就只是可读的。为什么是pmpaddr[n-1]？
+>> answer: 
